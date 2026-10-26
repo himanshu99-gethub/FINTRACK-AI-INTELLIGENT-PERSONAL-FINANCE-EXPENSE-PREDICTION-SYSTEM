@@ -20,6 +20,27 @@ def get_accounts(
         Account.is_archived == False
     ).order_by(Account.created_at.asc()).all()
 
+    if not accounts:
+        acc1 = Account(
+            user_id=current_user.id,
+            name="Current Account",
+            account_type="checking",
+            currency=current_user.default_currency,
+            opening_balance=Decimal("0.00")
+        )
+        acc2 = Account(
+            user_id=current_user.id,
+            name="Savings Account",
+            account_type="savings",
+            currency=current_user.default_currency,
+            opening_balance=Decimal("0.00")
+        )
+        db.add_all([acc1, acc2])
+        db.commit()
+        db.refresh(acc1)
+        db.refresh(acc2)
+        accounts = [acc1, acc2]
+
     results = []
     for acc in accounts:
         # Calculate current balance from transactions

@@ -27,18 +27,18 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
     db.add(user)
     db.flush()
 
-    # Create primary default accounts
+    # Create primary default accounts: Current Account and Savings Account
     acc1 = Account(
         user_id=user.id,
-        name="Main Bank Account",
-        account_type="bank",
+        name="Current Account",
+        account_type="checking",
         currency=user.default_currency,
         opening_balance=0.00
     )
     acc2 = Account(
         user_id=user.id,
-        name="Cash Wallet",
-        account_type="cash",
+        name="Savings Account",
+        account_type="savings",
         currency=user.default_currency,
         opening_balance=0.00
     )

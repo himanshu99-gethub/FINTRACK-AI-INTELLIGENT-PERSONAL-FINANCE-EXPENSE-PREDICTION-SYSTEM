@@ -1,7 +1,6 @@
 import { supabase } from './supabase';
 import { getStoredUser } from './api';
 import type { 
-  User, 
   Account, 
   Category, 
   Transaction, 
@@ -20,14 +19,21 @@ import type {
 // Helper to get active user ID
 function getActiveUserId(): string {
   const user = getStoredUser();
-  return user?.id || '00000000-0000-0000-0000-000000000001';
+  return user?.id || '';
 }
 
 export async function fallbackGetCategories(type?: string): Promise<Category[]> {
+  const userId = getActiveUserId();
   let query = supabase.from('categories').select('*').order('name');
   if (type) {
     query = query.eq('category_type', type as any);
   }
+  if (userId) {
+    query = query.or(`is_system.eq.true,user_id.eq.${userId}`);
+  } else {
+    query = query.eq('is_system', true);
+  }
+
   const { data, error } = await query;
   if (error || !data) {
     return [];
@@ -37,6 +43,8 @@ export async function fallbackGetCategories(type?: string): Promise<Category[]> 
 
 export async function fallbackCreateCategory(catData: Partial<Category>): Promise<Category> {
   const userId = getActiveUserId();
+  if (!userId) throw new Error('Authentication required');
+
   const { data, error } = await supabase.from('categories').insert([{
     name: catData.name || 'Custom Category',
     category_type: catData.category_type || 'expense',
@@ -54,22 +62,95 @@ export async function fallbackCreateCategory(catData: Partial<Category>): Promis
 
 export async function fallbackGetAccounts(): Promise<Account[]> {
   const userId = getActiveUserId();
-  const { data, error } = await supabase.from('accounts').select('*').eq('user_id', userId).eq('is_archived', false);
-  if (error || !data) {
+  if (!userId) return [];
+
+  const { data, error } = await supabase
+    .from('accounts')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('is_archived', false)
+    .order('created_at', { ascending: true });
+
+  if (error) {
     return [];
   }
-  return data as unknown as Account[];
+
+  let accounts = (data || []) as unknown as Account[];
+
+  // Auto-initialize standard default accounts with 0.00 opening balance if user has none
+  if (accounts.length === 0) {
+    const user = getStoredUser();
+    const curr = user?.default_currency || 'INR';
+    const initPayload = [
+      {
+        user_id: userId,
+        name: 'Current Account',
+        account_type: 'checking',
+        currency: curr,
+        opening_balance: 0,
+        current_balance: 0,
+        is_archived: false,
+      },
+      {
+        user_id: userId,
+        name: 'Savings Account',
+        account_type: 'savings',
+        currency: curr,
+        opening_balance: 0,
+        current_balance: 0,
+        is_archived: false,
+      }
+    ];
+
+    const { data: createdAccs } = await supabase
+      .from('accounts')
+      .insert(initPayload as any)
+      .select();
+
+    if (createdAccs && createdAccs.length > 0) {
+      accounts = createdAccs as unknown as Account[];
+    }
+  }
+
+  // Calculate live current balance dynamically from user's actual transactions
+  const { data: userTxs } = await supabase
+    .from('transactions')
+    .select('account_id, transaction_type, amount')
+    .eq('user_id', userId);
+
+  return accounts.map(acc => {
+    let bal = Number(acc.opening_balance || 0);
+    if (userTxs) {
+      for (const tx of (userTxs as any[])) {
+        if (tx.account_id === acc.id) {
+          const amt = Number(tx.amount || 0);
+          if (tx.transaction_type === 'income') {
+            bal += amt;
+          } else if (['expense', 'bill', 'debt', 'savings'].includes(tx.transaction_type)) {
+            bal -= amt;
+          }
+        }
+      }
+    }
+    return {
+      ...acc,
+      current_balance: String(bal),
+    };
+  });
 }
 
 export async function fallbackCreateAccount(accData: Partial<Account>): Promise<Account> {
   const userId = getActiveUserId();
+  if (!userId) throw new Error('Authentication required');
+
+  const openingBal = Number(accData.opening_balance || 0);
   const { data, error } = await supabase.from('accounts').insert([{
     user_id: userId,
-    name: accData.name || 'Main Checking',
+    name: accData.name || 'Bank Account',
     account_type: accData.account_type || 'checking',
     currency: accData.currency || 'INR',
-    opening_balance: Number(accData.opening_balance || 0),
-    current_balance: Number(accData.opening_balance || 0),
+    opening_balance: openingBal,
+    current_balance: openingBal,
     is_archived: false,
   } as any]).select().single();
 
@@ -89,12 +170,20 @@ export async function fallbackGetTransactions(params: {
   from?: string;
   to?: string;
 }): Promise<TransactionListResponse> {
+  const userId = getActiveUserId();
   const page = params.page || 1;
   const pageSize = params.page_size || 20;
   const fromOffset = (page - 1) * pageSize;
   const toOffset = fromOffset + pageSize - 1;
 
-  let query = supabase.from('transactions').select('*, category:categories(*)', { count: 'exact' });
+  if (!userId) {
+    return { items: [], total: 0, page, page_size: pageSize, total_pages: 0 };
+  }
+
+  let query = supabase
+    .from('transactions')
+    .select('*, category:categories(*)', { count: 'exact' })
+    .eq('user_id', userId);
 
   if (params.type) {
     query = query.eq('transaction_type', params.type as any);
@@ -135,6 +224,8 @@ export async function fallbackGetTransactions(params: {
 
 export async function fallbackCreateTransaction(txData: any): Promise<Transaction> {
   const userId = getActiveUserId();
+  if (!userId) throw new Error('Authentication required');
+
   const { data, error } = await supabase.from('transactions').insert([{
     user_id: userId,
     account_id: txData.account_id || null,
@@ -184,7 +275,14 @@ export async function fallbackDeleteTransaction(id: string): Promise<void> {
 }
 
 export async function fallbackGetBudgets(month?: string): Promise<Budget[]> {
-  let query = supabase.from('budgets').select('*, category:categories(*)');
+  const userId = getActiveUserId();
+  if (!userId) return [];
+
+  let query = supabase
+    .from('budgets')
+    .select('*, category:categories(*)')
+    .eq('user_id', userId);
+
   if (month) {
     const [year, m] = month.split('-');
     const startDate = `${year}-${m}-01`;
@@ -202,6 +300,8 @@ export async function fallbackGetBudgets(month?: string): Promise<Budget[]> {
 
 export async function fallbackCreateBudget(bgData: Partial<Budget>): Promise<Budget> {
   const userId = getActiveUserId();
+  if (!userId) throw new Error('Authentication required');
+
   const { data, error } = await supabase.from('budgets').insert([{
     user_id: userId,
     category_id: bgData.category_id || null,
@@ -225,9 +325,13 @@ export async function fallbackDeleteBudget(id: string): Promise<void> {
 }
 
 export async function fallbackGetBills(): Promise<Bill[]> {
+  const userId = getActiveUserId();
+  if (!userId) return [];
+
   const { data, error } = await supabase
     .from('bills')
     .select('*, category:categories(*)')
+    .eq('user_id', userId)
     .order('due_date', { ascending: true });
 
   if (error || !data) {
@@ -238,6 +342,8 @@ export async function fallbackGetBills(): Promise<Bill[]> {
 
 export async function fallbackCreateBill(bData: Partial<Bill>): Promise<Bill> {
   const userId = getActiveUserId();
+  if (!userId) throw new Error('Authentication required');
+
   const { data, error } = await supabase.from('bills').insert([{
     user_id: userId,
     category_id: bData.category_id || null,
@@ -277,9 +383,13 @@ export async function fallbackDeleteBill(id: string): Promise<void> {
 }
 
 export async function fallbackGetAlerts(): Promise<Alert[]> {
+  const userId = getActiveUserId();
+  if (!userId) return [];
+
   const { data, error } = await supabase
     .from('alerts')
     .select('*')
+    .eq('user_id', userId)
     .order('created_at', { ascending: false });
 
   if (error || !data) {
@@ -289,37 +399,62 @@ export async function fallbackGetAlerts(): Promise<Alert[]> {
 }
 
 export async function fallbackMarkAllAlertsRead(): Promise<{ message: string }> {
-  await supabase.from('alerts').update({ is_read: true } as any).eq('is_read', false);
+  const userId = getActiveUserId();
+  if (userId) {
+    await supabase.from('alerts').update({ is_read: true } as any).eq('user_id', userId).eq('is_read', false);
+  }
   return { message: 'All alerts marked as read' };
 }
 
 export async function fallbackGetDashboardSummary(month?: string): Promise<DashboardSummary> {
+  const userId = getActiveUserId();
   const currentPeriod = month || new Date().toISOString().slice(0, 7);
   const [year, m] = currentPeriod.split('-');
   const startDate = `${year}-${m}-01`;
   const lastDay = new Date(Number(year), Number(m), 0).getDate();
   const endDate = `${year}-${m}-${String(lastDay).padStart(2, '0')}`;
 
-  // Query transactions for the selected month
+  if (!userId) {
+    return {
+      period: currentPeriod,
+      currency: 'INR',
+      total_income: 0,
+      total_expenses: 0,
+      total_bills: 0,
+      total_debt_payments: 0,
+      total_savings: 0,
+      total_outflows: 0,
+      balance_left: 0,
+      budget_limit: 0,
+      budget_used_pct: 0,
+      recent_transactions: [],
+      upcoming_bills: [],
+    };
+  }
+
+  // Query transactions strictly for this user in the selected month
   const { data: txs } = await supabase
     .from('transactions')
     .select('*, category:categories(*)')
+    .eq('user_id', userId)
     .gte('transaction_date', startDate)
     .lte('transaction_date', endDate)
     .order('transaction_date', { ascending: false });
 
-  // Query upcoming bills
+  // Query upcoming bills strictly for this user
   const { data: bills } = await supabase
     .from('bills')
     .select('*, category:categories(*)')
+    .eq('user_id', userId)
     .gte('due_date', startDate)
     .lte('due_date', endDate)
     .order('due_date', { ascending: true });
 
-  // Query budgets
+  // Query budgets strictly for this user
   const { data: budgets } = await supabase
     .from('budgets')
     .select('*')
+    .eq('user_id', userId)
     .gte('period_start', startDate)
     .lte('period_end', endDate);
 
@@ -373,6 +508,9 @@ export async function fallbackGetDashboardSummary(month?: string): Promise<Dashb
 }
 
 export async function fallbackGetCategorySpending(month?: string): Promise<CategorySpendingItem[]> {
+  const userId = getActiveUserId();
+  if (!userId) return [];
+
   const currentPeriod = month || new Date().toISOString().slice(0, 7);
   const [year, m] = currentPeriod.split('-');
   const startDate = `${year}-${m}-01`;
@@ -382,6 +520,7 @@ export async function fallbackGetCategorySpending(month?: string): Promise<Categ
   const { data: txs } = await supabase
     .from('transactions')
     .select('*, category:categories(*)')
+    .eq('user_id', userId)
     .gte('transaction_date', startDate)
     .lte('transaction_date', endDate);
 
@@ -423,6 +562,9 @@ export async function fallbackGetCategorySpending(month?: string): Promise<Categ
 }
 
 export async function fallbackGetBudgetVsActual(month?: string): Promise<BudgetVsActualItem[]> {
+  const userId = getActiveUserId();
+  if (!userId) return [];
+
   const currentPeriod = month || new Date().toISOString().slice(0, 7);
   const [year, m] = currentPeriod.split('-');
   const startDate = `${year}-${m}-01`;
@@ -432,12 +574,14 @@ export async function fallbackGetBudgetVsActual(month?: string): Promise<BudgetV
   const { data: budgets } = await supabase
     .from('budgets')
     .select('*, category:categories(*)')
+    .eq('user_id', userId)
     .gte('period_start', startDate)
     .lte('period_end', endDate);
 
   const { data: txs } = await supabase
     .from('transactions')
     .select('*')
+    .eq('user_id', userId)
     .gte('transaction_date', startDate)
     .lte('transaction_date', endDate);
 
@@ -470,20 +614,50 @@ export async function fallbackGetBudgetVsActual(month?: string): Promise<BudgetV
 }
 
 export async function fallbackGetCashFlowTrend(months = 6): Promise<CashFlowTrendItem[]> {
+  const userId = getActiveUserId();
   const now = new Date();
   const result: CashFlowTrendItem[] = [];
+
+  const startPeriod = new Date(now.getFullYear(), now.getMonth() - months + 1, 1);
+  const startDateStr = `${startPeriod.getFullYear()}-${String(startPeriod.getMonth() + 1).padStart(2, '0')}-01`;
+
+  let userTxs: any[] = [];
+  if (userId) {
+    const { data } = await supabase
+      .from('transactions')
+      .select('amount, transaction_type, transaction_date')
+      .eq('user_id', userId)
+      .gte('transaction_date', startDateStr);
+    userTxs = data || [];
+  }
 
   for (let i = months - 1; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
     const mStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
     const label = d.toLocaleDateString('en-US', { month: 'short' });
+
+    let income = 0;
+    let expenses = 0;
+    let bills = 0;
+    let savings = 0;
+
+    for (const tx of userTxs) {
+      if (tx.transaction_date && tx.transaction_date.startsWith(mStr)) {
+        const amt = Number(tx.amount || 0);
+        if (tx.transaction_type === 'income') income += amt;
+        else if (tx.transaction_type === 'expense') expenses += amt;
+        else if (tx.transaction_type === 'bill') bills += amt;
+        else if (tx.transaction_type === 'savings') savings += amt;
+      }
+    }
+
     result.push({
       month: label,
-      income: 0,
-      expenses: 0,
-      bills: 0,
-      savings: 0,
-      net_savings: 0,
+      income,
+      expenses,
+      bills,
+      savings,
+      net_savings: income - (expenses + bills),
     });
   }
 
@@ -491,12 +665,33 @@ export async function fallbackGetCashFlowTrend(months = 6): Promise<CashFlowTren
 }
 
 export async function fallbackGetForecast(horizon = 1): Promise<ForecastData> {
+  const userId = getActiveUserId();
   const now = new Date();
   const nextMonth = new Date(now.getFullYear(), now.getMonth() + horizon, 1);
   const targetPeriod = nextMonth.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
 
-  // Compute from real historical transactions
-  const { data: txs } = await supabase.from('transactions').select('amount, transaction_type, transaction_date');
+  if (!userId) {
+    return {
+      target_period: targetPeriod,
+      predicted_expense: 0,
+      currency: 'INR',
+      method: 'Ridge ML Model',
+      history_months: 0,
+      confidence_label: 'low',
+      lower_bound: 0,
+      upper_bound: 0,
+      explanation: 'No transaction data available yet. Record expenses to train the AI projection engine.',
+      historical_points: [],
+      limitations: 'Projections require at least one month of transaction history.',
+    };
+  }
+
+  // Compute from real historical transactions for this user
+  const { data: txs } = await supabase
+    .from('transactions')
+    .select('amount, transaction_type, transaction_date')
+    .eq('user_id', userId);
+
   let historicalTotal = 0;
   let count = 0;
   for (const tx of (txs || [])) {
@@ -517,23 +712,60 @@ export async function fallbackGetForecast(horizon = 1): Promise<ForecastData> {
     lower_bound: Math.round(avgMonthly * 0.88),
     upper_bound: Math.round(avgMonthly * 1.15),
     explanation: count > 0 
-      ? `Forecast is generated by applying exponential smoothing over your recorded Supabase transactions.`
-      : `No expense transactions recorded in Supabase yet. Record expenses to train the AI projection engine.`,
+      ? `Forecast is generated by applying exponential smoothing over your recorded transactions.`
+      : `No expense transactions recorded yet. Record expenses to train the AI projection engine.`,
     historical_points: [],
     limitations: 'Projections assume consistent recurring patterns and do not account for unrecorded offline transactions.',
   };
 }
 
 export async function fallbackGetBudgetRecommendations(month?: string): Promise<BudgetRecommendation[]> {
-  const categories = await fallbackGetCategories('expense');
-  return categories.slice(0, 4).map(c => ({
-    category_id: c.id,
-    category_name: c.name,
-    current_budget: 0,
-    recent_avg_spend: 0,
-    recommended_budget_min: 5000,
-    recommended_budget_max: 8000,
-    explanation: `Based on standard financial guidelines for ${c.name}.`,
-    urgency: 'stable',
-  }));
+  const userId = getActiveUserId();
+  if (!userId) return [];
+
+  // Look at user transactions from past 90 days to derive genuine recommendations
+  const ninetyDaysAgo = new Date();
+  ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+  const dateStr = ninetyDaysAgo.toISOString().split('T')[0];
+
+  const { data: txs } = await supabase
+    .from('transactions')
+    .select('amount, category_id, category:categories(id, name)')
+    .eq('user_id', userId)
+    .eq('transaction_type', 'expense')
+    .gte('transaction_date', dateStr);
+
+  if (!txs || txs.length === 0) {
+    return [];
+  }
+
+  const catMap = new Map<string, { name: string; total: number }>();
+  for (const tx of txs as any[]) {
+    if (tx.category_id && tx.category) {
+      const existing = catMap.get(tx.category_id) || { name: tx.category.name, total: 0 };
+      existing.total += Number(tx.amount || 0);
+      catMap.set(tx.category_id, existing);
+    }
+  }
+
+  const recs: BudgetRecommendation[] = [];
+  for (const [catId, { name, total }] of catMap) {
+    const avgMonthly = Math.round(total / 3);
+    if (avgMonthly > 0) {
+      const minRec = Math.round(avgMonthly * 0.95);
+      const maxRec = Math.round(avgMonthly * 1.1);
+      recs.push({
+        category_id: catId,
+        category_name: name,
+        current_budget: 0,
+        recent_avg_spend: avgMonthly,
+        recommended_budget_min: minRec,
+        recommended_budget_max: maxRec,
+        explanation: `Based on your recent 90-day average spending of ${avgMonthly} in ${name}.`,
+        urgency: 'stable',
+      });
+    }
+  }
+
+  return recs;
 }

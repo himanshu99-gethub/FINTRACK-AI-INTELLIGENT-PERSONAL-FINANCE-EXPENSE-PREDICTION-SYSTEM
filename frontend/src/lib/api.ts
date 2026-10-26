@@ -188,14 +188,24 @@ export const getStoredUser = (): User | null => {
 };
 export const setStoredUser = (user: User) => localStorage.setItem('user', JSON.stringify(user));
 
-// Clear any stale mock items
+// Clear any stale mock items or demo sessions
 try {
   localStorage.removeItem('mock_transactions');
   localStorage.removeItem('mock_bills');
   const t = localStorage.getItem('token');
-  if (t && t.startsWith('mock-')) {
+  const u = localStorage.getItem('user');
+  if (u) {
+    try {
+      const parsed = JSON.parse(u);
+      if (parsed.id === '00000000-0000-0000-0000-000000000001' || parsed.email === 'demo@fintrack.ai') {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+      }
+    } catch {
+      localStorage.removeItem('user');
+    }
+  } else if (t && t.startsWith('mock-')) {
     localStorage.removeItem('token');
-    localStorage.removeItem('user');
   }
 } catch {
   // ignore
@@ -240,6 +250,7 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
   return res.json();
 }
 
+import { supabase } from './supabase';
 import * as fallback from './supabaseFallback';
 
 async function withSupabaseFallback<T>(
@@ -281,17 +292,35 @@ export const api = {
         return data;
       },
       async () => {
-        const fallbackUser: User = {
-          id: '00000000-0000-0000-0000-000000000001',
-          email,
-          display_name: email.split('@')[0],
-          default_currency: 'INR',
-          created_at: new Date().toISOString(),
-        };
-        const token = 'sb-cloud-token';
+        const cleanEmail = email.trim().toLowerCase();
+        const { data: existingUser } = await supabase
+          .from('users')
+          .select('*')
+          .eq('email', cleanEmail)
+          .maybeSingle();
+
+        let activeUser: User;
+        if (existingUser) {
+          activeUser = existingUser as unknown as User;
+        } else {
+          const newId = crypto.randomUUID();
+          const newUser: User = {
+            id: newId,
+            email: cleanEmail,
+            display_name: cleanEmail.split('@')[0],
+            default_currency: 'INR',
+            created_at: new Date().toISOString(),
+          };
+          await supabase.from('users').insert([{
+            ...newUser,
+            password_hash: 'fallback_hash',
+          } as any]);
+          activeUser = newUser;
+        }
+        const token = `sb-user-${activeUser.id}`;
         setToken(token);
-        setStoredUser(fallbackUser);
-        return { access_token: token, token_type: 'bearer', user: fallbackUser };
+        setStoredUser(activeUser);
+        return { access_token: token, token_type: 'bearer', user: activeUser };
       }
     );
   },
@@ -308,17 +337,57 @@ export const api = {
         return data;
       },
       async () => {
-        const fallbackUser: User = {
-          id: '00000000-0000-0000-0000-000000000001',
-          email,
-          display_name: display_name || email.split('@')[0],
+        const cleanEmail = email.trim().toLowerCase();
+        const { data: existingUser } = await supabase
+          .from('users')
+          .select('*')
+          .eq('email', cleanEmail)
+          .maybeSingle();
+
+        if (existingUser) {
+          throw new Error('An account with this email already exists.');
+        }
+
+        const newId = crypto.randomUUID();
+        const newUser: User = {
+          id: newId,
+          email: cleanEmail,
+          display_name: display_name.trim() || cleanEmail.split('@')[0],
           default_currency,
           created_at: new Date().toISOString(),
         };
-        const token = 'sb-cloud-token';
+
+        await supabase.from('users').insert([{
+          ...newUser,
+          password_hash: 'fallback_hash',
+        } as any]);
+
+        // Default empty accounts
+        await supabase.from('accounts').insert([
+          {
+            user_id: newId,
+            name: 'Current Account',
+            account_type: 'checking',
+            currency: default_currency,
+            opening_balance: 0,
+            current_balance: 0,
+            is_archived: false,
+          },
+          {
+            user_id: newId,
+            name: 'Savings Account',
+            account_type: 'savings',
+            currency: default_currency,
+            opening_balance: 0,
+            current_balance: 0,
+            is_archived: false,
+          }
+        ] as any);
+
+        const token = `sb-user-${newId}`;
         setToken(token);
-        setStoredUser(fallbackUser);
-        return { access_token: token, token_type: 'bearer', user: fallbackUser };
+        setStoredUser(newUser);
+        return { access_token: token, token_type: 'bearer', user: newUser };
       }
     );
   },
@@ -339,22 +408,64 @@ export const api = {
         let name = 'Google User';
         try {
           const payload = JSON.parse(atob(credential.split('.')[1]));
-          email = payload.email || email;
-          name = payload.name || name;
+          email = (payload.email || email).toLowerCase();
+          name = payload.name || payload.given_name || name;
         } catch {
           // ignore
         }
-        const fallbackUser: User = {
-          id: '00000000-0000-0000-0000-000000000001',
-          email,
-          display_name: name,
-          default_currency: 'INR',
-          created_at: new Date().toISOString(),
-        };
-        const token = 'sb-cloud-token';
+
+        const { data: existingUser } = await supabase
+          .from('users')
+          .select('*')
+          .eq('email', email)
+          .maybeSingle();
+
+        let activeUser: User;
+        if (existingUser) {
+          activeUser = existingUser as unknown as User;
+        } else {
+          const newId = crypto.randomUUID();
+          const newUser: User = {
+            id: newId,
+            email,
+            display_name: name,
+            default_currency: 'INR',
+            created_at: new Date().toISOString(),
+          };
+
+          await supabase.from('users').insert([{
+            ...newUser,
+            password_hash: 'google_oauth',
+          } as any]);
+
+          await supabase.from('accounts').insert([
+            {
+              user_id: newId,
+              name: 'Current Account',
+              account_type: 'checking',
+              currency: 'INR',
+              opening_balance: 0,
+              current_balance: 0,
+              is_archived: false,
+            },
+            {
+              user_id: newId,
+              name: 'Savings Account',
+              account_type: 'savings',
+              currency: 'INR',
+              opening_balance: 0,
+              current_balance: 0,
+              is_archived: false,
+            }
+          ] as any);
+
+          activeUser = newUser;
+        }
+
+        const token = `sb-user-${activeUser.id}`;
         setToken(token);
-        setStoredUser(fallbackUser);
-        return { access_token: token, token_type: 'bearer', user: fallbackUser };
+        setStoredUser(activeUser);
+        return { access_token: token, token_type: 'bearer', user: activeUser };
       }
     );
   },
